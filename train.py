@@ -6,117 +6,94 @@ import argparse
 import json
 from pathlib import Path
 
-import joblib
+import numpy as np
+from evaluation import evaluate_and_export
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
-TARGET = "price"  # Keep the prediction target separate from every feature transformation.
-NUMERIC_FEATURES = ["year", "mileage", "tax", "mpg", "engineSize"]  # Continuous vehicle attributes.
-CATEGORICAL_FEATURES = ["model", "transmission", "fuelType"]  # Nominal categories require one-hot encoding.
-REQUIRED_COLUMNS = [*CATEGORICAL_FEATURES, *NUMERIC_FEATURES, TARGET]  # Validate the input schema early.
+TARGET = "price"
+NUMERIC_FEATURES = ["year", "mileage", "tax", "mpg", "engineSize"]
+CATEGORICAL_FEATURES = ["model", "transmission", "fuelType"]
+REQUIRED_COLUMNS = [*CATEGORICAL_FEATURES, *NUMERIC_FEATURES, TARGET]
+
+
+def normalize_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Validate numeric inputs and make categorical missing values sklearn-compatible."""
+    for column in NUMERIC_FEATURES:
+        frame[column] = pd.to_numeric(frame[column], errors="raise")
+        if np.isinf(frame[column]).any():
+            raise ValueError(f"Feature {column} contains an infinite value.")
+    for column in CATEGORICAL_FEATURES:
+        frame[column] = frame[column].map(lambda value: value.strip() if isinstance(value, str) else value)
+        frame[column] = frame[column].replace("", np.nan).astype(object)
+        frame[column] = frame[column].where(frame[column].notna(), np.nan)
+    return frame
 
 
 def load_and_clean(path: str | Path) -> pd.DataFrame:
     """Load a CSV and apply only documented, defensible quality checks."""
-    frame = pd.read_csv(path)  # Read the user-supplied dataset without modifying the source file.
-    missing = sorted(set(REQUIRED_COLUMNS) - set(frame.columns))  # Find schema problems before training.
+    frame = pd.read_csv(path)
+    missing = sorted(set(REQUIRED_COLUMNS) - set(frame.columns))
     if missing:
-        raise ValueError(f"Dataset is missing required columns: {missing}")  # Fail with an actionable message.
+        raise ValueError(f"Dataset is missing required columns: {missing}")
 
-    frame = frame[REQUIRED_COLUMNS].copy()  # Retain only declared features and the target.
+    frame = frame[REQUIRED_COLUMNS].copy()
     for column in CATEGORICAL_FEATURES:
-        frame[column] = frame[column].astype("string").str.strip()  # Remove accidental leading/trailing label spaces.
+        frame[column] = frame[column].astype("string").str.strip()
 
-    frame = frame.dropna(subset=[TARGET])  # A row without a price cannot be used for supervised training.
-    frame = frame.loc[frame[TARGET] > 0].copy()  # Prices must be positive for this regression task.
-    frame = frame.loc[frame["year"].between(1990, 2027)].copy()  # Remove the clearly implausible future year in this dataset.
-    return frame
+    frame[TARGET] = pd.to_numeric(frame[TARGET], errors="raise")
+    if np.isinf(frame[TARGET]).any():
+        raise ValueError("Targets must be finite.")
+    frame = frame.dropna(subset=[TARGET])
+    frame = frame.loc[frame[TARGET] > 0].copy()
+    frame["year"] = pd.to_numeric(frame["year"], errors="raise")
+    frame = frame.loc[frame["year"].between(1990, 2027)].copy()
+    return normalize_features(frame)
 
 
 def build_preprocessor() -> ColumnTransformer:
     """Create preprocessing that is fitted only on training rows through a pipeline."""
     numeric_pipeline = Pipeline(
         steps=[
-            ("imputer", SimpleImputer(strategy="median")),  # Learn numeric replacements from training data only.
-            ("scaler", StandardScaler()),  # Scale only continuous values; never scale encoded categories.
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
         ]
     )
     categorical_pipeline = Pipeline(
         steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),  # Handle a missing category without dropping a row.
-            ("one_hot", OneHotEncoder(handle_unknown="ignore")),  # Avoid inventing an ordinal relationship between models.
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("one_hot", OneHotEncoder(handle_unknown="ignore")),
         ]
     )
     return ColumnTransformer(
         transformers=[
-            ("numeric", numeric_pipeline, NUMERIC_FEATURES),  # Apply numeric steps to numeric columns.
-            ("categorical", categorical_pipeline, CATEGORICAL_FEATURES),  # Apply category steps to text columns.
+            ("numeric", numeric_pipeline, NUMERIC_FEATURES),
+            ("categorical", categorical_pipeline, CATEGORICAL_FEATURES),
         ]
     )
 
 
-def regression_metrics(y_true: pd.Series, predictions) -> dict[str, float]:
-    """Return business-readable regression metrics in pounds."""
-    return {
-        "mae": round(float(mean_absolute_error(y_true, predictions)), 2),  # Typical absolute pricing error.
-        "rmse": round(float(mean_squared_error(y_true, predictions) ** 0.5), 2),  # Penalise large pricing mistakes.
-        "r2": round(float(r2_score(y_true, predictions)), 4),  # Proportion of held-out price variance explained.
-    }
-
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)  # Provide a clear command-line interface.
-    parser.add_argument("--data", required=True, help="Path to the Ford CSV file")  # Keep raw data outside the repository.
-    parser.add_argument("--output-dir", default="artifacts", help="Directory for the model and metrics")  # Store reproducible outputs together.
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data", required=True, help="Path to the documented CSV schema")
+    parser.add_argument("--output-dir", default="artifacts")
     args = parser.parse_args()
-
-    frame = load_and_clean(args.data)  # Clean before splitting, without seeing the test target during preprocessing.
-    X = frame.drop(columns=TARGET)  # Explicitly exclude price to prevent target leakage.
-    y = frame[TARGET]  # Keep the target in a separate series.
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42  # Preserve a fixed held-out test set for honest final evaluation.
-    )
-
-    candidates = {
-        "dummy_mean": DummyRegressor(strategy="mean"),  # Establish the minimum useful benchmark.
-        "ridge": Ridge(alpha=10.0),  # Use a regularised linear model as a transparent baseline.
-        "random_forest": RandomForestRegressor(
-            n_estimators=300, min_samples_leaf=2, random_state=42, n_jobs=-1  # Capture non-linear price effects reproducibly.
-        ),
-    }
-    results: dict[str, dict[str, float]] = {}  # Collect metrics before selecting the best model.
-    fitted_models = {}  # Retain fitted pipelines for later selection.
-    for name, estimator in candidates.items():
-        pipeline = Pipeline(
-            steps=[("preprocessor", build_preprocessor()), ("model", estimator)]  # Fit preprocessing and model together.
-        )
-        pipeline.fit(X_train, y_train)  # Learn transformations from training rows only.
-        results[name] = regression_metrics(y_test, pipeline.predict(X_test))  # Evaluate once on untouched test data.
-        fitted_models[name] = pipeline  # Keep the trained candidate for the winning-model export.
-
-    best_name = min(results, key=lambda name: results[name]["rmse"])  # Select by held-out pricing error, not training score.
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)  # Create a dedicated artifact location.
-    joblib.dump(fitted_models[best_name], output_dir / "model.joblib")  # Save preprocessing and model as one deployable object.
-    report = {
-        "dataset_rows": len(frame),  # Record the exact cleaned training population.
-        "train_rows": len(X_train),  # Record split sizes for reproducibility.
-        "test_rows": len(X_test),
-        "best_model": best_name,
-        "test_metrics": results,
-    }
-    (output_dir / "metrics.json").write_text(json.dumps(report, indent=2), encoding="utf-8")  # Save machine-readable evidence.
-    print(json.dumps(report, indent=2))  # Show the final evaluation in the terminal.
+    frame = load_and_clean(args.data)
+    candidates = {"dummy_mean": DummyRegressor(strategy="mean"), "ridge": Ridge(alpha=10.0),
+                  "random_forest": RandomForestRegressor(n_estimators=300, min_samples_leaf=3,
+                                                        random_state=42, n_jobs=-1)}
+    report = evaluate_and_export(frame, TARGET, build_preprocessor, candidates, args.data,
+                                 args.output_dir, classification=False)
+    print(json.dumps(report, indent=2))
 
 
 if __name__ == "__main__":
-    main()  # Run training only when this file is executed directly.
+    main()
